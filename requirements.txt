@@ -4,9 +4,7 @@ segmentation-models-pytorch
 rasterio
 numpy
 albumentations
-streamlit
-folium
-streamlit-folium
+Flask
 opencv-python-headless
 scikit-learn
 tqdm

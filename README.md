@@ -1,7 +1,7 @@
 # Satellite Flood Detection — Tamil Nadu (Hackathon MVP)
 
 U-Net (ResNet34 encoder) flood segmentation model trained on Sen1Floods11,
-with a Streamlit dashboard showing predicted flood extent on a Tamil Nadu map.
+with a standalone Flask web dashboard showing predicted flood extent on a Tamil Nadu map.
 
 ## Verified Working
 All code in this project has been syntax-checked and the model architecture
@@ -69,17 +69,17 @@ it as a 2-band GeoTIFF (VV, VH) before running inference.
 ## 5. Launch the Website
 
 ```bash
-streamlit run app.py
+python app.py
 ```
 
-Open the local URL Streamlit gives you, upload a SAR GeoTIFF, and view the
+Open http://127.0.0.1:5000, upload a SAR GeoTIFF, and view the
 predicted flood overlay, area/severity stats, and a ranked list of high-priority
 flood zones.
 
 ## What's Included (MVP Scope)
 - [x] Flood detection (U-Net segmentation)
 - [x] Flooded area calculation (km²)
-- [x] Basic severity classification (High/Medium/Low, by % area flooded)
+- [x] Population-aware risk classification using WorldPop India 2020 estimates
 - [x] Web dashboard with map overlay
 
 ## What's NOT Included Yet (documented as future work in the pitch)
@@ -96,4 +96,4 @@ flood zones.
   VV + VH (2 bands). If your source image has extra bands, select just the
   VV/VH bands before running inference.
 - **Model file not found in app.py:** make sure training finished and
-  `models/flood_unet.pth` exists before launching Streamlit.
+  `models/flood_unet.pth` exists before launching the website.

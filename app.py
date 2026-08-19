@@ -1,138 +1,123 @@
-"""
-app.py
-------
-Streamlit dashboard: upload a Sentinel-1 SAR image (GeoTIFF), run the
-trained flood-segmentation model, and view the predicted flood extent
-overlaid on a Tamil Nadu map.
-
-Run with:
-    streamlit run app.py
-"""
-
-import streamlit as st
-import numpy as np
-import folium
-from streamlit_folium import st_folium
-import rasterio
-from rasterio.warp import transform_bounds
-import tempfile
+"""Standalone web dashboard. Run with: python app.py"""
+import base64
 import os
+import tempfile
+
+import cv2
+import numpy as np
+import rasterio
+from flask import Flask, jsonify, render_template, request
+from rasterio.warp import transform_bounds
+from werkzeug.utils import secure_filename
 
 from infer import run_inference
-
-st.set_page_config(page_title="Flood Detection - Tamil Nadu", layout="wide")
-
-st.title("🌊 Satellite-Based Flood Detection — Tamil Nadu")
-st.markdown(
-    "Upload a Sentinel-1 SAR image (2-band GeoTIFF: VV, VH) of a Tamil Nadu "
-    "region to detect flooded areas and estimate affected area."
-)
+from risk import calculate_risk, population_exposure
 
 MODEL_PATH = "models/flood_unet.pth"
+ALLOWED_EXTENSIONS = {"tif", "tiff"}
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
-with st.sidebar:
-    st.header("Settings")
-    threshold = st.slider("Flood probability threshold", 0.1, 0.9, 0.5, 0.05)
-    st.markdown("---")
-    st.markdown(
-        "**Model:** U-Net (ResNet34 encoder)\n\n"
-        "**Trained on:** Sen1Floods11\n\n"
-        "**Input:** Sentinel-1 SAR (VV + VH)"
-    )
 
-uploaded_file = st.file_uploader("Upload Sentinel-1 SAR GeoTIFF", type=["tif", "tiff"])
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Tamil Nadu approximate center for default map view
-TN_CENTER = [11.1271, 78.6569]
 
-if uploaded_file is not None:
+def image_bounds(image_path):
+    with rasterio.open(image_path) as source:
+        if source.count < 2:
+            raise ValueError("The GeoTIFF must contain at least two SAR bands (VV and VH).")
+        bounds = source.bounds
+        if source.crs and source.crs.to_string() != "EPSG:4326":
+            west, south, east, north = transform_bounds(source.crs, "EPSG:4326", *bounds)
+        elif source.crs:
+            west, south, east, north = bounds.left, bounds.bottom, bounds.right, bounds.top
+        else:
+            raise ValueError("The uploaded GeoTIFF has no coordinate reference system (CRS).")
+    return [[south, west], [north, east]]
+
+
+def mask_to_data_url(mask):
+    rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    rgba[..., 0], rgba[..., 1], rgba[..., 2] = 239, 68, 68
+    rgba[..., 3] = (mask * 165).astype(np.uint8)
+    success, encoded = cv2.imencode(".png", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
+    if not success:
+        raise ValueError("Could not create the flood-mask overlay.")
+    return "data:image/png;base64," + base64.b64encode(encoded).decode("ascii")
+
+
+def add_tile_bounds(tiles, scene_bounds, mask_shape, tile_size=32):
+    """Attach latitude/longitude bounds to each ranked model tile."""
+    south, west = scene_bounds[0]
+    north, east = scene_bounds[1]
+    height, width = mask_shape
+    lat_span, lon_span = north - south, east - west
+    for tile in tiles:
+        row_start, col_start = (tile["row"] - 1) * tile_size, (tile["column"] - 1) * tile_size
+        row_end, col_end = min(row_start + tile_size, height), min(col_start + tile_size, width)
+        tile_north = north - (row_start / height) * lat_span
+        tile_south = north - (row_end / height) * lat_span
+        tile_west = west + (col_start / width) * lon_span
+        tile_east = west + (col_end / width) * lon_span
+        tile["bounds"] = [[tile_south, tile_west], [tile_north, tile_east]]
+    return tiles
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.get("/api/health")
+def health():
+    return jsonify(status="ok", population_risk_enabled=True)
+
+
+@app.post("/api/analyze")
+def analyze():
+    upload = request.files.get("image")
+    if not upload or not upload.filename:
+        return jsonify(error="Choose a Sentinel-1 GeoTIFF before running analysis."), 400
+    if not allowed_file(upload.filename):
+        return jsonify(error="Only .tif and .tiff files are supported."), 400
     if not os.path.exists(MODEL_PATH):
-        st.error(
-            f"No trained model found at `{MODEL_PATH}`. "
-            "Run `python train.py --data_dir <path>` first to produce it."
-        )
-    else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as tmp:
-            tmp.write(uploaded_file.read())
-            tmp_path = tmp.name
+        return jsonify(error=f"Model checkpoint not found: {MODEL_PATH}"), 500
+    try:
+        threshold = float(request.form.get("threshold", 0.5))
+        if not 0.1 <= threshold <= 0.9:
+            raise ValueError("Threshold must be between 0.10 and 0.90.")
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
 
-        with st.spinner("Running flood detection model..."):
-            try:
-                result = run_inference(tmp_path, MODEL_PATH, threshold=threshold)
+    suffix = os.path.splitext(secure_filename(upload.filename))[1].lower() or ".tif"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = temp_file.name
+            upload.save(temp_file)
+        bounds = image_bounds(temp_path)
+        result = run_inference(temp_path, MODEL_PATH, threshold=threshold)
+        flood_percent = float(result["mask"].mean() * 100)
+        population = population_exposure(result["mask"], bounds)
+        risk = calculate_risk(flood_percent, population)
+        priority_tiles = add_tile_bounds(result["priority_tiles"], bounds, result["mask"].shape)
+        return jsonify(area_km2=result["area_km2"], flooded_pixels=result["flooded_pixels"],
+                       flood_percent=round(flood_percent, 1), risk=risk, population=population,
+                       bounds=bounds, mask_url=mask_to_data_url(result["mask"]),
+                       priority_tiles=priority_tiles)
+    except Exception as exc:
+        app.logger.exception("Analysis failed")
+        return jsonify(error=f"Unable to process this image: {exc}"), 422
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
-                # get lat/lon bounds of the uploaded image for map placement
-                with rasterio.open(tmp_path) as src:
-                    bounds = src.bounds
-                    if src.crs and src.crs.to_string() != "EPSG:4326":
-                        west, south, east, north = transform_bounds(
-                            src.crs, "EPSG:4326", *bounds
-                        )
-                    else:
-                        west, south, east, north = bounds.left, bounds.bottom, bounds.right, bounds.top
 
-                col1, col2 = st.columns([2, 1])
+@app.errorhandler(413)
+def upload_too_large(_error):
+    return jsonify(error="File is too large. The maximum upload size is 200 MB."), 413
 
-                with col1:
-                    st.subheader("Predicted Flood Map")
-                    m = folium.Map(
-                        location=[(south + north) / 2, (west + east) / 2],
-                        zoom_start=11,
-                        tiles="OpenStreetMap",
-                    )
 
-                    # overlay predicted mask as a red-tinted image layer
-                    mask_rgba = np.zeros((*result["mask"].shape, 4), dtype=np.uint8)
-                    mask_rgba[..., 0] = 255  # red channel
-                    mask_rgba[..., 3] = (result["mask"] * 150).astype(np.uint8)  # alpha
-
-                    folium.raster_layers.ImageOverlay(
-                        image=mask_rgba,
-                        bounds=[[south, west], [north, east]],
-                        opacity=0.7,
-                        name="Predicted Flood Extent",
-                    ).add_to(m)
-
-                    folium.LayerControl().add_to(m)
-                    st_folium(m, width=800, height=550)
-
-                with col2:
-                    st.subheader("Flood Impact Summary")
-                    st.metric("Estimated Flooded Area", f"{result['area_km2']} km²")
-                    st.metric("Flooded Pixels", f"{result['flooded_pixels']:,}")
-
-                    flood_pct = (result["mask"].sum() / result["mask"].size) * 100
-                    st.metric("% of Image Flooded", f"{flood_pct:.1f}%")
-
-                    st.subheader("High-Priority Flood Zones")
-                    st.caption("Tiles are ranked by predicted flood coverage and confidence.")
-                    for rank, tile in enumerate(result["priority_tiles"], start=1):
-                        st.write(
-                            f"{rank}. Row {tile['row']}, column {tile['column']} | "
-                            f"{tile['flood_coverage'] * 100:.1f}% flooded | "
-                            f"priority {tile['priority_score']:.3f}"
-                        )
-
-                    if flood_pct > 30:
-                        st.error("🔴 HIGH severity — large-scale flooding detected")
-                    elif flood_pct > 10:
-                        st.warning("🟠 MEDIUM severity — moderate flooding detected")
-                    else:
-                        st.success("🟢 LOW severity — limited flooding detected")
-
-                    st.markdown("---")
-                    st.caption(
-                        "Note: severity thresholds above are illustrative for the MVP. "
-                        "Production use should incorporate population and infrastructure "
-                        "overlays for accurate rescue-priority ranking."
-                    )
-
-            except Exception as e:
-                st.error(f"Error processing image: {e}")
-            finally:
-                os.unlink(tmp_path)
-
-else:
-    st.info("👆 Upload a Sentinel-1 SAR GeoTIFF to get started.")
-    st.subheader("Tamil Nadu — Default View")
-    m = folium.Map(location=TN_CENTER, zoom_start=7, tiles="OpenStreetMap")
-    st_folium(m, width=1000, height=500)
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False)
