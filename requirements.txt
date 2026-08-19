@@ -1,0 +1,12 @@
+torch
+torchvision
+segmentation-models-pytorch
+rasterio
+numpy
+albumentations
+streamlit
+folium
+streamlit-folium
+opencv-python-headless
+scikit-learn
+tqdm
