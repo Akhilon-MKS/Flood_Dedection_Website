@@ -68,8 +68,8 @@ def estimate_area(mask, pixel_res_m=PIXEL_RESOLUTION_M):
     return flooded_pixels, area_km2
 
 
-def rank_priority_tiles(prob_map, tile_size=32, threshold=0.5, top_k=5):
-    """Rank image tiles by predicted flood coverage and mean confidence."""
+def rank_priority_tiles(prob_map, tile_size=32, threshold=0.5, top_k=None):
+    """Return model tiles, optionally limited by flood coverage and confidence."""
     height, width = prob_map.shape
     tiles = []
     for row in range(0, height, tile_size):
@@ -84,7 +84,8 @@ def rank_priority_tiles(prob_map, tile_size=32, threshold=0.5, top_k=5):
                 "confidence": confidence,
                 "priority_score": coverage * confidence,
             })
-    return sorted(tiles, key=lambda item: item["priority_score"], reverse=True)[:top_k]
+    ranked_tiles = sorted(tiles, key=lambda item: item["priority_score"], reverse=True)
+    return ranked_tiles[:top_k] if top_k is not None else ranked_tiles
 
 
 def run_inference(image_path, model_path, device=None, img_size=256, threshold=0.5):
@@ -94,7 +95,9 @@ def run_inference(image_path, model_path, device=None, img_size=256, threshold=0
     tensor, transform, crs, orig_shape = preprocess_image(image_path, img_size)
     mask, prob_map = predict_flood_mask(model, tensor, device, threshold)
     flooded_pixels, area_km2 = estimate_area(mask)
-    priority_tiles = rank_priority_tiles(prob_map, threshold=threshold)
+    # The web dashboard applies the final population-aware ranking after it
+    # enriches every tile with local exposure and risk information.
+    priority_tiles = rank_priority_tiles(prob_map, threshold=threshold, top_k=None)
 
     return {
         "mask": mask,              # (img_size, img_size) binary array

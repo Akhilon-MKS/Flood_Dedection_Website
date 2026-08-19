@@ -85,6 +85,20 @@ def add_tile_metrics(tiles, mask, scene_bounds, tile_size=32):
     return tiles
 
 
+def rank_population_aware_tiles(tiles, top_k=5):
+    """Prioritize local risk and exposed people over flood area alone."""
+    return sorted(
+        tiles,
+        key=lambda tile: (
+            tile["risk"]["score"],
+            (tile["population"] or {}).get("exposed_population", 0),
+            tile["flooded_pixels"],
+            tile["confidence"],
+        ),
+        reverse=True,
+    )[:top_k]
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -124,6 +138,7 @@ def analyze():
         risk = calculate_risk(flood_percent, population)
         priority_tiles = add_tile_bounds(result["priority_tiles"], bounds, result["mask"].shape)
         priority_tiles = add_tile_metrics(priority_tiles, result["mask"], bounds)
+        priority_tiles = rank_population_aware_tiles(priority_tiles)
         return jsonify(area_km2=result["area_km2"], flooded_pixels=result["flooded_pixels"],
                        flood_percent=round(flood_percent, 1), risk=risk, population=population,
                        bounds=bounds, mask_url=mask_to_data_url(result["mask"]),
