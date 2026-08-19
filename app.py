@@ -64,6 +64,27 @@ def add_tile_bounds(tiles, scene_bounds, mask_shape, tile_size=32):
     return tiles
 
 
+def add_tile_metrics(tiles, mask, scene_bounds, tile_size=32):
+    """Add local flood, population, and risk estimates to ranked tiles."""
+    height, width = mask.shape
+    for tile in tiles:
+        row_start, col_start = (tile["row"] - 1) * tile_size, (tile["column"] - 1) * tile_size
+        row_end, col_end = min(row_start + tile_size, height), min(col_start + tile_size, width)
+        tile_mask = mask[row_start:row_end, col_start:col_end]
+        flooded_pixels = int(tile_mask.sum())
+        # The model mask represents 10 m × 10 m Sentinel-1 ground pixels.
+        area_km2 = flooded_pixels * (10 ** 2) / 1_000_000
+        flood_percent = float(tile_mask.mean() * 100) if tile_mask.size else 0.0
+        population = population_exposure(tile_mask, tile["bounds"])
+        risk = calculate_risk(flood_percent, population)
+        tile["area_km2"] = round(area_km2, 3)
+        tile["flooded_pixels"] = flooded_pixels
+        tile["flood_percent"] = round(flood_percent, 1)
+        tile["population"] = population
+        tile["risk"] = risk
+    return tiles
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -102,6 +123,7 @@ def analyze():
         population = population_exposure(result["mask"], bounds)
         risk = calculate_risk(flood_percent, population)
         priority_tiles = add_tile_bounds(result["priority_tiles"], bounds, result["mask"].shape)
+        priority_tiles = add_tile_metrics(priority_tiles, result["mask"], bounds)
         return jsonify(area_km2=result["area_km2"], flooded_pixels=result["flooded_pixels"],
                        flood_percent=round(flood_percent, 1), risk=risk, population=population,
                        bounds=bounds, mask_url=mask_to_data_url(result["mask"]),
