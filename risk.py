@@ -54,11 +54,20 @@ def population_exposure(flood_mask, bounds, population_path=POPULATION_PATH):
 
 
 def calculate_risk(flood_percent, population):
-    """Combine the currently available flood and population factors (0–1)."""
+    """Combine flood extent with the number of people exposed (0–1)."""
     flood_score = float(min(1.0, max(0.0, flood_percent / 100.0)))
-    density_score = float(population["density_score"]) if population else 0.0
-    # The available factors share the total weight equally. Later layers can
-    # replace this with w1...w5 for infrastructure, roads, and elevation.
-    risk_score = float(0.5 * flood_score + 0.5 * density_score)
+    # Population density alone is not a flood risk. A scene with no predicted
+    # flooded pixels must be reported as no risk, regardless of density.
+    if flood_score == 0.0:
+        return {"score": 0.0, "level": "no", "flood_score": 0.0}
+    exposed_population = max(0, int(population["exposed_population"])) if population else 0
+    # Prioritize the people who are actually within the predicted flood area.
+    # The logarithmic scale prevents a small difference at high population
+    # counts from dominating, while still strongly separating 1 person from
+    # 100+ people.
+    exposure_score = min(1.0, math.log1p(exposed_population) / math.log1p(100))
+    risk_score = float(0.4 * flood_score + 0.6 * exposure_score)
     risk_level = "high" if risk_score >= 0.65 else "medium" if risk_score >= 0.35 else "low"
-    return {"score": round(risk_score, 3), "level": risk_level, "flood_score": round(flood_score, 3)}
+    return {"score": round(risk_score, 3), "level": risk_level,
+            "flood_score": round(flood_score, 3),
+            "exposure_score": round(exposure_score, 3)}
